@@ -3,3 +3,5 @@ opencv-python
 pytesseract
 python-pptx
 numpy
+streamlit
+python-dotenv
