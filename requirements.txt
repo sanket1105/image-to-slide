@@ -5,4 +5,3 @@ python-pptx
 numpy
 streamlit
 python-dotenv
-cv2
