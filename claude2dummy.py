@@ -1,13 +1,16 @@
 import base64
 import io
 import json
+import math
 import os
 from io import BytesIO
 
+import cv2
+import numpy as np
 import requests
 import streamlit as st
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageOps
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
@@ -38,14 +41,207 @@ class WhiteboardToPPT:
         self.horizontal_spacing = Inches(0.4)  # Space between elements horizontally
         self.vertical_spacing = Inches(0.4)  # Space between elements vertically
 
-    def analyze_image(self, image_data):
+    def rotate_image(self, image_data, angle):
+        """
+        Manually rotate the image by a specified angle.
+
+        Parameters:
+        - image_data: The binary image data
+        - angle: Rotation angle in degrees (positive = counterclockwise)
+
+        Returns:
+        - Rotated image as binary data
+        """
+        try:
+            # Convert image data to OpenCV format
+            nparr = np.frombuffer(image_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            # Get image dimensions
+            h, w = img.shape[:2]
+            center = (w // 2, h // 2)
+
+            # Calculate rotation matrix
+            M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+            # Calculate new image dimensions after rotation
+            cos = abs(M[0, 0])
+            sin = abs(M[0, 1])
+            new_w = int((h * sin) + (w * cos))
+            new_h = int((h * cos) + (w * sin))
+
+            # Adjust the rotation matrix to take into account the translation
+            M[0, 2] += (new_w / 2) - center[0]
+            M[1, 2] += (new_h / 2) - center[1]
+
+            # Perform the rotation
+            rotated = cv2.warpAffine(
+                img,
+                M,
+                (new_w, new_h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255, 255, 255),  # White border
+            )
+
+            # Convert the rotated OpenCV image back to bytes
+            success, rotated_image = cv2.imencode(".jpg", rotated)
+            rotated_data = rotated_image.tobytes()
+
+            return rotated_data
+        except Exception as e:
+            st.error(f"Error during image rotation: {e}")
+            # Return original image if rotation fails
+            return image_data
+
+    def preprocess_image(self, image_data, manual_rotation=None):
+        """
+        Preprocess the image to enhance OCR accuracy:
+        1. Apply manual rotation if specified
+        2. Convert to OpenCV format
+        3. Detect edges and correct skew/rotation (if manual rotation not specified)
+        4. Enhance contrast and sharpness
+        5. Remove noise
+
+        Parameters:
+        - image_data: The binary image data
+        - manual_rotation: Optional manual rotation angle (degrees)
+
+        Returns:
+        - Processed image as binary data
+        """
+        try:
+            # First apply manual rotation if specified
+            if manual_rotation is not None and manual_rotation != 0:
+                st.info(f"Applying manual rotation: {manual_rotation} degrees")
+                image_data = self.rotate_image(image_data, manual_rotation)
+
+            # Convert image data to OpenCV format
+            nparr = np.frombuffer(image_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            # Keep a copy of the original for comparison
+            original_img = img.copy()
+
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Apply bilateral filter to reduce noise while preserving edges
+            gray = cv2.bilateralFilter(gray, 11, 17, 17)
+
+            # Auto-rotation only if manual rotation is not specified
+            if manual_rotation is None:
+                # Detect edges in the image
+                edges = cv2.Canny(gray, 30, 200)
+
+                # Use Hough Line Transform to detect lines
+                lines = cv2.HoughLinesP(
+                    edges, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10
+                )
+
+                if lines is not None and len(lines) > 0:
+                    # Find the dominant angle
+                    angles = []
+                    for line in lines:
+                        x1, y1, x2, y2 = line[0]
+                        if x2 - x1 != 0:  # Avoid division by zero
+                            angle = math.atan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+                            # We're interested in horizontal and vertical lines
+                            # Normalize angles to find lines close to horizontal (0 or 180 degrees)
+                            norm_angle = abs(angle) % 180
+                            if norm_angle > 90:
+                                norm_angle = 180 - norm_angle
+                            if norm_angle < 45:  # Consider it a horizontal line
+                                angles.append(angle)
+
+                    if angles:
+                        # Calculate the median angle to avoid outliers
+                        median_angle = np.median(angles)
+
+                        # Rotate the image to correct the skew
+                        if (
+                            abs(median_angle) > 0.5
+                        ):  # Only rotate if the angle is significant
+                            st.info(
+                                f"Correcting image skew: {median_angle:.2f} degrees"
+                            )
+
+                            # Get image dimensions
+                            h, w = img.shape[:2]
+                            center = (w // 2, h // 2)
+
+                            # Calculate rotation matrix
+                            M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+
+                            # Calculate new image dimensions after rotation
+                            cos = abs(M[0, 0])
+                            sin = abs(M[0, 1])
+                            new_w = int((h * sin) + (w * cos))
+                            new_h = int((h * cos) + (w * sin))
+
+                            # Adjust the rotation matrix to take into account the translation
+                            M[0, 2] += (new_w / 2) - center[0]
+                            M[1, 2] += (new_h / 2) - center[1]
+
+                            # Perform the rotation
+                            rotated = cv2.warpAffine(
+                                img,
+                                M,
+                                (new_w, new_h),
+                                flags=cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(255, 255, 255),
+                            )
+                            img = rotated
+
+            # Enhance contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            enhanced = clahe.apply(gray)
+
+            # Merge enhanced image back to color if needed
+            if img.shape[2] == 3:  # If it's a color image
+                enhanced_color = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+                # Blend with original for a more natural look
+                img = cv2.addWeighted(img, 0.7, enhanced_color, 0.3, 0)
+
+            # Convert the processed OpenCV image back to bytes
+            success, processed_image = cv2.imencode(".jpg", img)
+            processed_data = processed_image.tobytes()
+
+            # Display original and processed images for comparison
+            with st.expander("Image Preprocessing Results", expanded=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Convert original OpenCV image to PIL for display
+                    original_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+                    st.image(original_rgb, caption="Original Image")
+                with col2:
+                    # Convert processed OpenCV image to PIL for display
+                    processed_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    st.image(processed_rgb, caption="Processed Image")
+
+            return processed_data
+        except Exception as e:
+            st.error(f"Error during image preprocessing: {e}")
+            # Return original image if preprocessing fails
+            return image_data
+
+    def analyze_image(self, image_data, rotation_angle=None):
         """
         Use AI vision model to analyze the whiteboard image and extract information.
         Returns structured data about text content and layout.
+
+        Parameters:
+        - image_data: The binary image data
+        - rotation_angle: Optional manual rotation angle (degrees)
         """
         try:
-            # Convert image to base64
-            image_base64 = base64.b64encode(image_data).decode("utf-8")
+            # Preprocess the image to enhance OCR accuracy
+            processed_image_data = self.preprocess_image(image_data, rotation_angle)
+
+            # Convert preprocessed image to base64
+            image_base64 = base64.b64encode(processed_image_data).decode("utf-8")
 
             # Enhanced prompt for the vision model with better OCR instructions
             prompt = """
@@ -168,6 +364,7 @@ class WhiteboardToPPT:
             st.error(f"Error analyzing image: {e}")
             return None
 
+    # Rest of your class methods remain the same
     def _validate_analysis_data(self, data):
         """Validate the analysis data for duplicates and missing elements"""
         if not data or "elements" not in data:
@@ -611,97 +808,55 @@ class WhiteboardToPPT:
                     height=phase_height,
                 )
 
-                # Apply gradient fill for modern look
+                # Style the phase box for better visibility
                 fill = phase_shape.fill
                 fill.solid()
-                fill.fore_color.rgb = RGBColor(240, 240, 255)  # Light blue background
+                fill.fore_color.rgb = RGBColor(230, 230, 250)  # Light lavender
 
-                # Configure the shape outline
+                # Add border to the shape
                 line = phase_shape.line
-                line.color.rgb = RGBColor(100, 100, 180)  # Darker blue outline
+                line.color.rgb = RGBColor(128, 128, 128)  # Gray border
                 line.width = Pt(1.5)
 
-                # Add text with improved styling
+                # Add text to the phase
                 text_frame = phase_shape.text_frame
                 text_frame.text = phase
-                text_frame.margin_left = Pt(6)
-                text_frame.margin_right = Pt(6)
-                text_frame.margin_top = Pt(3)
-                text_frame.margin_bottom = Pt(3)
+                text_frame.margin_bottom = Inches(0.05)
+                text_frame.margin_left = Inches(0.05)
+                text_frame.margin_right = Inches(0.05)
+                text_frame.margin_top = Inches(0.05)
                 text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
 
-                p = text_frame.paragraphs[0]
-                p.font.size = Pt(14)
-                p.font.bold = True
-                p.font.name = "Calibri"
-                p.font.color.rgb = RGBColor(0, 0, 0)  # Black text for all phases
-                p.alignment = PP_ALIGN.CENTER
+                # Style the text
+                para = text_frame.paragraphs[0]
+                para.alignment = PP_ALIGN.CENTER
+                para.font.bold = True
+                para.font.size = Pt(14)
+                para.font.name = "Arial"
+                para.font.color.rgb = RGBColor(0, 0, 102)  # Dark blue text
 
-                # Ensure all runs have black text
-                for run in p.runs:
-                    run.font.color.rgb = RGBColor(0, 0, 0)
+        # 3. Intelligently position and create elements
+        elements_data = self._intelligently_position_elements(analysis_data)
 
-        # 3. Add the vertical section labels on the left with improved styling
-        if "sections" in analysis_data and analysis_data["sections"]:
-            for i, section in enumerate(analysis_data["sections"]):
-                # Calculate position with better spacing
-                section_y = Inches(1.8 + i * 1.6)
+        # Track created shapes for connecting lines
+        created_shapes = {}
 
-                section_shape = slide.shapes.add_shape(
-                    MSO_SHAPE.ROUNDED_RECTANGLE,
-                    left=Inches(0.3),
-                    top=section_y,
-                    width=Inches(0.9),
-                    height=Inches(1.2),
-                )
+        # Create all elements first
+        for element_id, data in elements_data.items():
+            element = data["element"]
+            position = data["position"]
+            width = data["width"]
+            height = data["height"]
 
-                # Apply styling
-                section_shape.fill.solid()
-                section_shape.fill.fore_color.rgb = RGBColor(
-                    245, 245, 245
-                )  # Light gray
-                section_shape.line.color.rgb = RGBColor(120, 120, 120)  # Gray outline
+            # Determine shape type based on element type
+            shape_type = MSO_SHAPE.RECTANGLE  # Default
 
-                # Add text
-                text_frame = section_shape.text_frame
-                text_frame.text = section
-                text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
-                section_shape.rotation = 270  # Rotate text vertically
-
-                p = text_frame.paragraphs[0]
-                p.font.size = Pt(12)
-                p.font.name = "Calibri"
-                p.font.bold = True
-                p.font.color.rgb = RGBColor(0, 0, 0)  # Black text for sections
-                p.alignment = PP_ALIGN.CENTER
-
-                # Ensure all runs have black text
-                for run in p.runs:
-                    run.font.color.rgb = RGBColor(0, 0, 0)
-
-        # 4. Intelligent positioning of elements
-        element_layout = self._intelligently_position_elements(analysis_data)
-
-        # Track shapes for connections
-        element_shapes = {}
-
-        # Create elements based on calculated layout
-        for element_id, element_data in element_layout.items():
-            element = element_data["element"]
-            position = element_data["position"]
-            width = element_data["width"]
-            height = element_data["height"]
-
-            # Determine shape type based on element properties
-            shape_type = MSO_SHAPE.ROUNDED_RECTANGLE
-
-            # Use appropriate shape type based on element type
-            if element.get("type") == "note":
+            if element.get("type") == "cloud":
                 shape_type = MSO_SHAPE.CLOUD
-            elif element.get("type") == "cloud":
-                shape_type = MSO_SHAPE.CLOUD
+            elif element.get("type") == "note":
+                shape_type = MSO_SHAPE.ROUNDED_RECTANGLE
 
-            # Create the shape
+            # Create the shape with appropriate styling
             shape = slide.shapes.add_shape(
                 shape_type,
                 left=position["left"],
@@ -710,252 +865,199 @@ class WhiteboardToPPT:
                 height=height,
             )
 
-            # Apply styling based on importance
+            # Style the shape based on importance/emphasis
+            emphasis = element.get("emphasis", "medium")
             importance = element.get("importance", 1)
 
-            # Define colors based on importance/emphasis
-            if importance >= 3 or element.get("emphasis") == "high":
-                # High importance - stronger color
-                shape.fill.solid()
-                shape.fill.fore_color.rgb = RGBColor(255, 240, 240)  # Light red tint
-                shape.line.color.rgb = RGBColor(180, 100, 100)  # Red outline
-                shape.line.width = Pt(2.0)
-            elif importance == 2 or element.get("emphasis") == "medium":
-                # Medium importance
-                shape.fill.solid()
-                shape.fill.fore_color.rgb = RGBColor(240, 255, 240)  # Light green tint
-                shape.line.color.rgb = RGBColor(100, 160, 100)  # Green outline
-                shape.line.width = Pt(1.5)
+            # Set fill color based on emphasis level
+            fill = shape.fill
+            fill.solid()
+
+            # Color scheme based on emphasis
+            if emphasis == "high" or importance >= 3:
+                # Light orange for high emphasis
+                fill.fore_color.rgb = RGBColor(255, 235, 205)
+                line_color = RGBColor(255, 165, 0)  # Orange border
+                line_width = Pt(2.5)
+            elif emphasis == "medium" or importance == 2:
+                # Light blue for medium emphasis
+                fill.fore_color.rgb = RGBColor(220, 235, 255)
+                line_color = RGBColor(100, 149, 237)  # Cornflower blue border
+                line_width = Pt(2.0)
             else:
-                # Normal importance
-                shape.fill.solid()
-                shape.fill.fore_color.rgb = RGBColor(250, 250, 250)  # Off-white
-                shape.line.color.rgb = RGBColor(100, 100, 100)  # Gray outline
-                shape.line.width = Pt(1.0)
+                # Light gray for low emphasis
+                fill.fore_color.rgb = RGBColor(245, 245, 245)
+                line_color = RGBColor(169, 169, 169)  # Gray border
+                line_width = Pt(1.5)
 
-            # Add text with proper formatting - ensure text is black
+            # Set border style
+            line = shape.line
+            line.color.rgb = line_color
+            line.width = line_width
+
+            # Add text content
             text_frame = shape.text_frame
+            text_frame.text = element.get("text", "")
             text_frame.word_wrap = True
-            text_frame.text = ""  # Clear any default text
+            text_frame.margin_bottom = Inches(0.05)
+            text_frame.margin_left = Inches(0.05)
+            text_frame.margin_right = Inches(0.05)
+            text_frame.margin_top = Inches(0.05)
 
-            # Set margin for better text appearance
-            text_frame.margin_left = Pt(6)
-            text_frame.margin_right = Pt(6)
-            text_frame.margin_top = Pt(3)
-            text_frame.margin_bottom = Pt(3)
-
-            # Set vertical alignment
+            # Center text vertically
             text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
 
-            # Create a new paragraph
-            p = text_frame.paragraphs[0]
+            # Style the text
+            para = text_frame.paragraphs[0]
+            para.alignment = PP_ALIGN.CENTER
+            para.font.size = Pt(12)
+            para.font.name = "Arial"
 
-            # Add the text as a run to ensure color control
-            run = p.add_run()
-            run.text = element["text"]
-
-            # Adjust font size based on text length and importance
-            text_length = element.get("text_length", len(element["text"]))
-
-            if text_length > 70:
-                font_size = 9
-            elif text_length > 50:
-                font_size = 10
-            elif text_length > 30:
-                font_size = 11
-            else:
-                font_size = 12
-
-            # Increase font size for important elements
+            # Make important text bold
             if importance >= 2:
-                font_size += 1
+                para.font.bold = True
 
-            run.font.size = Pt(font_size)
-            run.font.name = "Calibri"
+            # Store the created shape for connections
+            created_shapes[element_id] = shape
 
-            # Bold for important elements
-            if importance >= 2:
-                run.font.bold = True
-
-            # Explicitly set text color to black
-            run.font.color.rgb = RGBColor(0, 0, 0)  # Pure black text
-
-            # Set paragraph alignment
-            p.alignment = PP_ALIGN.CENTER
-
-            # Store shape info for connections
-            element_shapes[element_id] = {
-                "shape": shape,
-                "left": position["left"],
-                "top": position["top"],
-                "width": width,
-                "height": height,
-            }
-
-        # 5. Add connections (arrows) with improved styling
+        # Now create all connections
         if "connections" in analysis_data:
             for connection in analysis_data["connections"]:
                 from_id = connection.get("from_id")
                 to_id = connection.get("to_id")
                 arrow_type = connection.get("arrow_type", "simple")
 
-                # Skip if shapes don't exist
-                if from_id not in element_shapes or to_id not in element_shapes:
-                    continue
+                # Make sure both shapes exist
+                if from_id in created_shapes and to_id in created_shapes:
+                    from_shape = created_shapes[from_id]
+                    to_shape = created_shapes[to_id]
 
-                from_shape = element_shapes[from_id]
-                to_shape = element_shapes[to_id]
+                    # Determine connector type and styling
+                    if arrow_type == "double":
+                        # Double-headed arrow
+                        begin_arrow_type = MSO_THEME_COLOR.ACCENT_1
+                        end_arrow_type = MSO_THEME_COLOR.ACCENT_1
+                    elif arrow_type == "simple":
+                        # Single-headed arrow
+                        begin_arrow_type = None
+                        end_arrow_type = MSO_THEME_COLOR.ACCENT_1
+                    else:
+                        # No arrows, just a line
+                        begin_arrow_type = None
+                        end_arrow_type = None
 
-                # Calculate center points
-                from_center_x = from_shape["left"] + (from_shape["width"] / 2)
-                from_center_y = from_shape["top"] + (from_shape["height"] / 2)
-                to_center_x = to_shape["left"] + (to_shape["width"] / 2)
-                to_center_y = to_shape["top"] + (to_shape["height"] / 2)
+                    # Create the connector
+                    connector = slide.shapes.add_connector(
+                        MSO_CONNECTOR.STRAIGHT, 0, 0, 0, 0
+                    )
 
-                # Calculate angle and direction of connection
-                dx = to_center_x - from_center_x
-                dy = to_center_y - from_center_y
+                    # Connect the shapes
+                    connector.begin_connect(from_shape, 0)
+                    connector.end_connect(to_shape, 0)
 
-                # Determine the best connection points based on angle
-                # (This creates more natural looking connectors)
+                    # Style the connector
+                    connector.line.color.rgb = RGBColor(100, 100, 100)  # Dark gray line
+                    connector.line.width = Pt(1.5)
 
-                # Calculate starting point (on the edge of the source shape)
-                if abs(dx) > abs(dy):  # More horizontal than vertical
-                    if dx > 0:  # Right direction
-                        start_x = from_shape["left"] + from_shape["width"]
-                        start_y = from_center_y
-                    else:  # Left direction
-                        start_x = from_shape["left"]
-                        start_y = from_center_y
-                else:  # More vertical than horizontal
-                    if dy > 0:  # Down direction
-                        start_x = from_center_x
-                        start_y = from_shape["top"] + from_shape["height"]
-                    else:  # Up direction
-                        start_x = from_center_x
-                        start_y = from_shape["top"]
+                    # Set arrow styling if needed
+                    if arrow_type == "dashed":
+                        connector.line.dash_style = MSO_LINE_DASH_STYLE.DASH
 
-                # Calculate ending point (on the edge of the target shape)
-                if abs(dx) > abs(dy):  # More horizontal than vertical
-                    if dx > 0:  # Right direction
-                        end_x = to_shape["left"]
-                        end_y = to_center_y
-                    else:  # Left direction
-                        end_x = to_shape["left"] + to_shape["width"]
-                        end_y = to_center_y
-                else:  # More vertical than horizontal
-                    if dy > 0:  # Down direction
-                        end_x = to_center_x
-                        end_y = to_shape["top"]
-                    else:  # Up direction
-                        end_x = to_center_x
-                        end_y = to_shape["top"] + to_shape["height"]
+                    # Set arrows based on arrow_type
+                    if end_arrow_type:
+                        connector.line.end_arrow_type = end_arrow_type
+                    if begin_arrow_type:
+                        connector.line.begin_arrow_type = begin_arrow_type
 
-                # Create an improved connector
-                connector_type = MSO_CONNECTOR.STRAIGHT
+        # Return the created presentation
+        return prs
 
-                # Use curved connectors for longer distances
-                if (abs(dx) + abs(dy)) > Inches(4).inches:
-                    connector_type = MSO_CONNECTOR.CURVE
+    def save_ppt(self, prs, filename="output.pptx"):
+        """Save the PowerPoint presentation to a file and return it as bytes"""
+        # Save to a BytesIO object
+        ppt_bytes = BytesIO()
+        prs.save(ppt_bytes)
+        ppt_bytes.seek(0)
 
-                connector = slide.shapes.add_connector(
-                    connector_type, start_x, start_y, end_x, end_y
-                )
+        # Also save to a file if specified
+        if filename:
+            prs.save(filename)
+            st.success(f"Presentation saved as {filename}")
 
-                # Style the connector based on arrow_type
-                connector.line.color.rgb = RGBColor(100, 100, 100)  # Gray arrow
-                connector.line.width = Pt(1.5)
-
-                # Enhanced styling
-                if arrow_type == "double":
-                    connector.line.width = Pt(2.0)
-                    connector.line.dash_style = MSO_LINE_DASH_STYLE.DASH
-                    connector.line.begin_style = 1  # Simple arrow
-                    connector.line.end_style = 1  # Simple arrow
-                else:  # Simple or default
-                    connector.line.dash_style = MSO_LINE_DASH_STYLE.SOLID
-                    connector.line.end_style = 1  # Simple arrow at end
-
-        # Save the PowerPoint
-        pptx_io = BytesIO()
-        prs.save(pptx_io)
-        pptx_io.seek(0)
-        return pptx_io
-
-    def process_image_to_ppt(self, image_data):
-        """
-        Main method to process image and create PowerPoint.
-        """
-        # Step 1: Analyze image with AI
-        analysis_data = self.analyze_image(image_data)
-
-        if not analysis_data:
-            st.error("Failed to analyze image")
-            return None
-
-        # Step 2: Create PowerPoint from analysis
-        with st.status("Creating PowerPoint slide...", expanded=True) as status:
-            pptx_data = self.create_ppt_from_analysis(analysis_data)
-            status.update(label="PowerPoint creation complete!", state="complete")
-
-        return pptx_data
+        return ppt_bytes.getvalue()
 
 
 def main():
     st.set_page_config(
-        page_title="Whiteboard to PowerPoint Converter", page_icon="📊", layout="wide"
+        page_title="Whiteboard to PowerPoint Converter",
+        page_icon="📊",
+        layout="wide",
     )
 
     st.title("Whiteboard to PowerPoint Converter")
-    st.markdown(
-        """
-    Transform your whiteboard images into organized PowerPoint slides.
-    Upload a photo of your whiteboard, and our AI will detect elements and create a professional slide.
-    """
+    st.write(
+        "Upload a whiteboard image and convert it to a structured PowerPoint presentation."
     )
 
+    # Initialize the converter
     converter = WhiteboardToPPT()
 
+    # File uploader for whiteboard image
     uploaded_file = st.file_uploader(
         "Upload a whiteboard image", type=["jpg", "jpeg", "png"]
     )
 
-    if uploaded_file:
+    # Manual rotation option
+    rotation_angle = st.slider(
+        "Rotation angle (if needed)",
+        min_value=-180,
+        max_value=180,
+        value=0,
+        step=5,
+        help="Adjust if your image needs rotation",
+    )
+
+    if uploaded_file is not None:
         # Display the uploaded image
-        image = Image.open(uploaded_file)
+        st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Original Whiteboard")
-            st.image(image, use_column_width=True)
+        # Process button
+        if st.button("Convert to PowerPoint"):
+            with st.spinner("Processing your whiteboard image..."):
+                try:
+                    # Analyze the image
+                    image_data = uploaded_file.getvalue()
+                    analysis_data = converter.analyze_image(image_data, rotation_angle)
 
-        # Convert image to bytes for processing
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format=image.format)
-        img_byte_arr = img_byte_arr.getvalue()
+                    if analysis_data:
+                        # Create PowerPoint from analysis
+                        ppt = converter.create_ppt_from_analysis(analysis_data)
 
-        # Process image and get PowerPoint
-        pptx_data = converter.process_image_to_ppt(img_byte_arr)
+                        # Save and provide download link
+                        ppt_bytes = converter.save_ppt(
+                            ppt, "whiteboard_presentation.pptx"
+                        )
 
-        if pptx_data:
-            with col2:
-                st.subheader("PowerPoint Preview")
-                st.write("PowerPoint successfully created!")
-                st.info("Download your PowerPoint file using the button below.")
+                        # Create download button
+                        st.download_button(
+                            label="Download PowerPoint",
+                            data=ppt_bytes,
+                            file_name="whiteboard_presentation.pptx",
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        )
 
-            # Provide download option
-            st.download_button(
-                label="Download PowerPoint",
-                data=pptx_data,
-                file_name="whiteboard_conversion.pptx",
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            )
-        else:
-            st.error("Failed to create PowerPoint. Please try with a clearer image.")
+                        st.success("Conversion completed successfully!")
+                    else:
+                        st.error(
+                            "Failed to analyze the image. Please try a different image or adjust rotation."
+                        )
+
+                except Exception as e:
+                    st.error(f"An error occurred during processing: {e}")
+                    import traceback
+
+                    st.error(traceback.format_exc())
 
 
 if __name__ == "__main__":
     main()
-
-
-## much better final code
