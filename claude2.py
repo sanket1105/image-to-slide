@@ -927,7 +927,7 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Original Whiteboard")
-            st.image(image, use_column_width=True)
+            st.image(image, use_container_width=True)
 
         # Convert image to bytes for processing
         img_byte_arr = io.BytesIO()
